@@ -3,6 +3,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Requ
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from typing import Optional, List
 import json
 import logging
 from datetime import datetime
@@ -10,6 +11,9 @@ import os
 import asyncio
 from dotenv import load_dotenv
 from livekit import api
+
+# Import evaluation module
+from evaluator import AnswerEvaluator, get_evaluator
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -46,6 +50,20 @@ class TokenRequest(BaseModel):
     identity: str
     metadata: str | None = None
     candidateDetails: dict | None = None  # Accept candidate details directly in token request
+
+class AnswerEvaluationRequest(BaseModel):
+    room_id: str
+    question: str
+    answer: str
+    candidate_id: Optional[str] = None
+    question_number: Optional[int] = None
+    expected_keywords: Optional[List[str]] = None
+    difficulty_level: str = "medium"
+
+class CompleteInterviewRequest(BaseModel):
+    room_id: str
+    session_id: Optional[str] = None
+    candidate_id: Optional[str] = None
 
 @app.post("/token")
 async def generate_token(req: TokenRequest):
@@ -171,7 +189,8 @@ async def generate_token(req: TokenRequest):
             metadata_dict['sessionId'] = session_data.get('session_id')
             metadata_dict['jobDetails'] = session_data.get('job_details', {})
         
-        agent_name = os.getenv("LIVEKIT_AGENT_NAME", "interview-agent")
+        
+        agent_name = os.getenv("LIVEKIT_AGENT_NAME", "interview")  # ✅ Match .env value
         logger.info("=" * 80)
         logger.info(f"🤖 DISPATCHING AGENT")
         logger.info(f"   Agent Name: {agent_name}")
@@ -206,10 +225,15 @@ async def generate_token(req: TokenRequest):
             metadata=agent_metadata_json,
         )
         
+        
         logger.info(f"🔧 Agent Dispatch Created:")
         logger.info(f"   - Agent Name: {agent_dispatch.agent_name}")
         logger.info(f"   - Metadata Present: {bool(agent_dispatch.metadata)}")
         logger.info(f"   - Metadata Length: {len(agent_dispatch.metadata) if agent_dispatch.metadata else 0} bytes")
+        # ✅ ADD: Log first 500 chars of metadata for debugging
+        if agent_dispatch.metadata:
+            logger.info(f"   - Metadata preview: {agent_dispatch.metadata[:500]}...")
+        
         
         token = (
             api.AccessToken(api_key=LIVEKIT_API_KEY, api_secret=LIVEKIT_API_SECRET)
@@ -405,6 +429,147 @@ async def interview_websocket(websocket: WebSocket, room_id: str):
                 if 'websocket' in active_sessions[key]:
                     del active_sessions[key]['websocket']
 
+@app.post("/api/evaluate-answer")
+async def evaluate_answer(request: AnswerEvaluationRequest):
+    """
+    Evaluate a candidate's answer to an interview question
+    
+    This endpoint uses AI to analyze and score the candidate's response.
+    The evaluation includes accuracy, completeness, and feedback.
+    """
+    try:
+        logger.info("=" * 80)
+        logger.info(f"📝 EVALUATING ANSWER")
+        logger.info(f"   Room: {request.room_id}")
+        logger.info(f"   Question: {request.question[:100]}...")
+        logger.info(f"   Answer length: {len(request.answer)} chars")
+        logger.info("=" * 80)
+        
+        # Get or create evaluator for this session
+        evaluator = get_evaluator()
+        
+        # Perform evaluation
+        evaluation = await evaluator.evaluate_answer(
+            question=request.question,
+            answer=request.answer,
+            expected_keywords=request.expected_keywords,
+            difficulty_level=request.difficulty_level,
+            context=f"Candidate ID: {request.candidate_id}"
+        )
+        
+        logger.info(f"✅ Evaluation complete")
+        logger.info(f"   Score: {evaluation.get('score', 0)}/10")
+        logger.info(f"   Correct: {evaluation.get('is_correct', False)}")
+        logger.info(f"   Partial: {evaluation.get('is_partial', False)}")
+        
+        return {
+            "success": True,
+            "evaluation": evaluation,
+            "room_id": request.room_id,
+            "question_number": request.question_number
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Answer evaluation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/complete-interview")
+async def complete_interview(request: CompleteInterviewRequest):
+    """
+    Complete interview and calculate final performance analytics
+    
+    This endpoint aggregates all evaluations and provides:
+    - Overall score
+    - Strengths and weaknesses
+    - Detailed metrics
+    - Hiring recommendation
+    """
+    try:
+        logger.info("=" * 80)
+        logger.info(f"🏁 COMPLETING INTERVIEW")
+        logger.info(f"   Room: {request.room_id}")
+        logger.info(f"   Session: {request.session_id}")
+        logger.info("=" * 80)
+        
+        # Get evaluator
+        evaluator = get_evaluator()
+        
+        # Calculate overall performance
+        performance = evaluator.calculate_overall_performance()
+        
+        logger.info(f"✅ Performance calculated")
+        logger.info(f"   Total Score: {performance.get('total_score', 0)}%")
+        logger.info(f"   Total Questions: {performance.get('total_questions', 0)}")
+        logger.info(f"   Correct: {performance.get('correct_answers', 0)}")
+        logger.info(f"   Wrong: {performance.get('wrong_answers', 0)}")
+        logger.info(f"   Partial: {performance.get('partial_answers', 0)}")
+        
+        return {
+            "success": True,
+            "room_id": request.room_id,
+            "score": performance.get("total_score", 0),
+            "performance": {
+                "total_score": performance.get("total_score", 0),
+                "correct_answers": performance.get("correct_answers", 0),
+                "wrong_answers": performance.get("wrong_answers", 0),
+                "partial_answers": performance.get("partial_answers", 0),
+                "total_questions": performance.get("total_questions", 0),
+                "strengths": performance.get("strengths", []),
+                "weaknesses": performance.get("weaknesses", []),
+                "recommendation": performance.get("recommendation", "")
+            },
+            "analysis": performance.get("metrics", {
+                "accuracy": 0,
+                "technical_score": 0,
+                "communication_score": 0,
+                "response_rate": 0,
+                "confidence_level": 0
+            })
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Complete interview failed: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/interview-stats/{room_id}")
+async def get_interview_stats(room_id: str):
+    """
+    Get current interview statistics for a room
+    
+    Returns real-time stats like questions asked, answers received, etc.
+    """
+    try:
+        # Get evaluator to check current progress
+        evaluator = get_evaluator()
+        
+        if not evaluator.evaluation_history:
+            return {
+                "room_id": room_id,
+                "questions_asked": 0,
+                "answers_evaluated": 0,
+                "current_score": 0
+            }
+        
+        current_performance = evaluator.calculate_overall_performance()
+        
+        return {
+            "room_id": room_id,
+            "questions_asked": current_performance.get("total_questions", 0),
+            "answers_evaluated": current_performance.get("total_questions", 0),
+            "current_score": current_performance.get("total_score", 0),
+            "correct_answers": current_performance.get("correct_answers", 0),
+            "wrong_answers": current_performance.get("wrong_answers", 0),
+            "partial_answers": current_performance.get("partial_answers", 0)
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Get stats failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/health")
 async def health():
     return {
@@ -412,7 +577,8 @@ async def health():
         "active_sessions": len(active_sessions),
         "stored_candidates": len(candidate_details_store),
         "server": "Backend API",
-        "port": 8001
+        "port": 8001,
+        "evaluation_enabled": True
     }
 
 if __name__ == "__main__":
