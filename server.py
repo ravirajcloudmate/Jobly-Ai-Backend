@@ -3,7 +3,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Requ
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 import json
 import logging
 from datetime import datetime
@@ -64,6 +64,18 @@ class CompleteInterviewRequest(BaseModel):
     room_id: str
     session_id: Optional[str] = None
     candidate_id: Optional[str] = None
+
+class SessionReportRequest(BaseModel):
+    room_id: str
+    candidate_id: Optional[str] = None
+    candidate_name: Optional[str] = None
+    candidate_email: Optional[str] = None
+    job_id: Optional[str] = None
+    performance: Dict[str, Any]
+    transcript: List[Dict[str, Any]]
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    responses: List[Dict[str, Any]] = []
 
 @app.post("/token")
 async def generate_token(req: TokenRequest):
@@ -568,6 +580,136 @@ async def get_interview_stats(room_id: str):
         
     except Exception as e:
         logger.error(f"❌ Get stats failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/save-session-report")
+async def save_session_report(request: SessionReportRequest):
+    """
+    Save complete session report with transcript and performance
+    
+    This is called by the agent when the interview ends.
+    """
+    try:
+        logger.info("=" * 80)
+        logger.info("💾 SAVING SESSION REPORT")
+        logger.info(f"   Room: {request.room_id}")
+        logger.info(f"   Candidate: {request.candidate_name}")
+        logger.info(f"   Total Score: {request.performance.get('total_score', 0)}%")
+        logger.info(f"   Questions: {request.performance.get('total_questions', 0)}")
+        logger.info("=" * 80)
+        
+        # Here you would save to your database
+        # Example for MongoDB:
+        """
+        session_report = {
+            "room_id": request.room_id,
+            "candidate_id": request.candidate_id,
+            "candidate_name": request.candidate_name,
+            "candidate_email": request.candidate_email,
+            "job_id": request.job_id,
+            "performance": request.performance,
+            "transcript": request.transcript,
+            "responses": request.responses,
+            "start_time": request.start_time,
+            "end_time": request.end_time,
+            "created_at": datetime.now().isoformat()
+        }
+        
+        # Save to MongoDB
+        result = await db.session_reports.insert_one(session_report)
+        logger.info(f"✅ Session report saved with ID: {result.inserted_id}")
+        """
+        
+        # For now, just log it
+        logger.info("=" * 80)
+        logger.info("📊 SESSION REPORT:")
+        logger.info(f"   Candidate: {request.candidate_name} ({request.candidate_email})")
+        logger.info(f"   Performance: {request.performance.get('total_score', 0)}% score")
+        logger.info(f"   Correct: {request.performance.get('correct_answers', 0)}")
+        logger.info(f"   Wrong: {request.performance.get('wrong_answers', 0)}")
+        logger.info(f"   Transcript entries: {len(request.transcript)}")
+        logger.info(f"   Evaluated responses: {len(request.responses)}")
+        logger.info(f"   Duration: {request.start_time} to {request.end_time}")
+        logger.info("=" * 80)
+        
+        # Store session report in memory (can be moved to database)
+        if request.room_id not in active_sessions:
+            active_sessions[request.room_id] = {}
+        
+        active_sessions[request.room_id]['session_report'] = {
+            "room_id": request.room_id,
+            "candidate_id": request.candidate_id,
+            "candidate_name": request.candidate_name,
+            "candidate_email": request.candidate_email,
+            "job_id": request.job_id,
+            "performance": request.performance,
+            "transcript": request.transcript,
+            "responses": request.responses,
+            "start_time": request.start_time,
+            "end_time": request.end_time,
+            "saved_at": datetime.now().isoformat()
+        }
+        
+        # Notify WebSocket clients if connected
+        if request.room_id in active_sessions:
+            ws = active_sessions[request.room_id].get('websocket')
+            if ws:
+                try:
+                    await ws.send_json({
+                        'type': 'session_complete',
+                        'room_id': request.room_id,
+                        'performance': request.performance,
+                        'message': 'Interview session completed and report saved'
+                    })
+                    logger.info("✅ WebSocket notification sent to frontend")
+                except Exception as e:
+                    logger.warning(f"⚠️ Could not send WebSocket notification: {e}")
+        
+        return {
+            "success": True,
+            "message": "Session report saved successfully",
+            "room_id": request.room_id,
+            "saved_at": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Save session report failed: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/session-report/{room_id}")
+async def get_session_report(room_id: str):
+    """
+    Retrieve saved session report for a room
+    """
+    try:
+        # Check in-memory storage first
+        if room_id in active_sessions and 'session_report' in active_sessions[room_id]:
+            logger.info(f"✅ Found session report for room: {room_id}")
+            return {
+                "success": True,
+                "report": active_sessions[room_id]['session_report']
+            }
+        
+        # Example: Fetch from database
+        """
+        report = await db.session_reports.find_one({"room_id": room_id})
+        if not report:
+            raise HTTPException(status_code=404, detail="Session report not found")
+        
+        # Convert ObjectId to string for JSON serialization
+        report["_id"] = str(report["_id"])
+        return report
+        """
+        
+        # Not found
+        raise HTTPException(status_code=404, detail="Session report not found")
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Get session report failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health")

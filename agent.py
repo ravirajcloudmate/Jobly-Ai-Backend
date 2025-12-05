@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import warnings
+import httpx
 from dataclasses import dataclass, field
 from typing import Optional, List
 from datetime import datetime
@@ -14,7 +15,7 @@ warnings.filterwarnings("ignore", message=".*conflict with protected namespace.*
 
 
 from livekit import agents, rtc
-from livekit.agents import Worker, WorkerOptions, AgentSession, Agent
+from livekit.agents import WorkerOptions, AgentSession, Agent
 from livekit.plugins import openai, silero
 
 # Import evaluation and tracking modules
@@ -191,9 +192,12 @@ class InterviewAgent(Agent):
         try:
             if text and text.strip():
                 add_message("agent", text)
+                logger.info(f"💬 AGENT SPEECH ADDED: {text[:100]}...")
                 print("🔵 AGENT:", text)
         except Exception as e:
             logger.error(f"❌ Error in on_agent_speech: {e}")
+            import traceback
+            traceback.print_exc()
     
     async def _handle_user_answer(self, answer: str):
         """Handle user's answer and evaluate it"""
@@ -575,25 +579,202 @@ INTERVIEW GUIDELINES:
         logger.info("✅ InterviewAgent created with system prompt")
         logger.info("🚀 Starting agent in room...")
         
+        # Enable recording for the session (audio, transcripts, traces, and logs)
+        # This ensures recording is enabled even if the interview doesn't start properly
         await session.start(
             agent=agent,
             room=ctx.room,
+            record=True  # Enable recording for entire session
         )
         
         logger.info("✅ SESSION STARTED - Agent is now in the room")
         
+        # ✅ NEW: Add session end callback
+        async def on_session_end():
+            """Called when session ends - save everything"""
+            try:
+                logger.info("=" * 80)
+                logger.info("🏁 SESSION ENDING - Saving all data...")
+                logger.info("=" * 80)
+                
+                interview_data = session.userdata
+                
+                # 0. Final capture: Get any remaining messages from conversation history
+                try:
+                    if hasattr(session, 'conversation') and session.conversation:
+                        logger.info("📋 Capturing final messages from conversation history...")
+                        messages = session.conversation
+                        if hasattr(messages, '__len__') and len(messages) > 0:
+                            from transcript_saver import get_buffer_size
+                            buffer_before = get_buffer_size()
+                            
+                            for msg in messages:
+                                try:
+                                    if hasattr(msg, 'role') and hasattr(msg, 'content'):
+                                        text = str(msg.content).strip() if msg.content else ""
+                                        if text:
+                                            if msg.role == 'user':
+                                                await agent.on_user_transcript(text)
+                                            elif msg.role == 'assistant' or msg.role == 'agent':
+                                                await agent.on_agent_speech(text)
+                                    elif hasattr(msg, 'role') and hasattr(msg, 'text'):
+                                        text = str(msg.text).strip() if msg.text else ""
+                                        if text:
+                                            if msg.role == 'user':
+                                                await agent.on_user_transcript(text)
+                                            elif msg.role == 'assistant' or msg.role == 'agent':
+                                                await agent.on_agent_speech(text)
+                                except Exception as e:
+                                    logger.debug(f"Error capturing final message: {e}")
+                            
+                            buffer_after = get_buffer_size()
+                            if buffer_after > buffer_before:
+                                logger.info(f"✅ Captured {buffer_after - buffer_before} additional messages from conversation history")
+                except Exception as e:
+                    logger.debug(f"Could not capture final messages: {e}")
+                
+                # 1. Save transcript to database
+                if interview_data.transcript_saver:
+                    logger.info("💾 Saving transcript to database...")
+                    success = interview_data.transcript_saver.save_transcript()
+                    if success:
+                        logger.info("✅ Transcript saved successfully")
+                    else:
+                        logger.error("❌ Transcript save failed")
+                
+                # 2. Calculate final performance
+                transcript = []
+                if interview_data.evaluator:
+                    performance = interview_data.evaluator.calculate_overall_performance()
+                    
+                    logger.info("=" * 80)
+                    logger.info("📊 FINAL PERFORMANCE:")
+                    logger.info(f"   Total Score: {performance.get('total_score', 0)}%")
+                    logger.info(f"   Questions Asked: {performance.get('total_questions', 0)}")
+                    logger.info(f"   Correct Answers: {performance.get('correct_answers', 0)}")
+                    logger.info(f"   Wrong Answers: {performance.get('wrong_answers', 0)}")
+                    logger.info(f"   Recommendation: {performance.get('recommendation', 'N/A')}")
+                    logger.info("=" * 80)
+                    
+                    # Get transcript
+                    transcript = interview_data.tracker.get_transcript() if interview_data.tracker else []
+                    
+                    # 3. Send final analytics to frontend (if room still exists and connected)
+                    if interview_data.room_instance:
+                        try:
+                            # Check if room is still connected - try different methods
+                            room_connected = False
+                            try:
+                                # Method 1: Check connection_state attribute
+                                if hasattr(interview_data.room_instance, 'connection_state'):
+                                    room_connected = interview_data.room_instance.connection_state == rtc.ConnectionState.CONNECTED
+                                # Method 2: Check if room has local participant
+                                elif hasattr(interview_data.room_instance, 'local_participant') and interview_data.room_instance.local_participant:
+                                    room_connected = True
+                                # Method 3: Try to access room properties (if accessible, likely connected)
+                                else:
+                                    # Just try to send - if it fails, we'll catch it
+                                    room_connected = True
+                            except:
+                                room_connected = False
+                            
+                            if room_connected:
+                                await LiveKitMessageSender.send_interview_complete(
+                                    room=interview_data.room_instance,
+                                    performance=performance,
+                                    transcript=transcript
+                                )
+                                logger.info("✅ Final analytics sent to frontend via LiveKit")
+                            else:
+                                logger.warning(f"⚠️ Room not connected, skipping LiveKit message")
+                        except Exception as e:
+                            logger.warning(f"⚠️ Could not send final analytics via LiveKit: {e}")
+                            # Fallback: Send via backend API which will forward to frontend
+                            logger.info("🔄 Attempting to send via backend API as fallback...")
+                    
+                    # 4. Save performance to backend API (this will also notify frontend)
+                    try:
+                        backend_url = os.getenv("BACKEND_URL", "http://localhost:8001")
+                        
+                        # Get transcript from buffer if available
+                        from transcript_saver import get_transcript as get_transcript_buffer
+                        transcript_from_buffer = get_transcript_buffer()
+                        if transcript_from_buffer:
+                            logger.info(f"📝 Found {len(transcript_from_buffer)} messages in transcript buffer")
+                            # Convert to format expected by API
+                            transcript = [
+                                {
+                                    "sender": msg.get("sender", "unknown"),
+                                    "text": msg.get("text", ""),
+                                    "timestamp": msg.get("timestamp", 0)
+                                }
+                                for msg in transcript_from_buffer
+                            ]
+                        
+                        async with httpx.AsyncClient() as client:
+                            response = await client.post(
+                                f"{backend_url}/api/save-session-report",
+                                json={
+                                    "room_id": ctx.room.name,
+                                    "candidate_id": interview_data.candidate_id,
+                                    "candidate_name": interview_data.candidate_name,
+                                    "candidate_email": interview_data.candidate_email,
+                                    "job_id": interview_data.job_id,
+                                    "performance": performance,
+                                    "transcript": transcript,
+                                    "start_time": interview_data.start_time.isoformat() if interview_data.start_time else None,
+                                    "end_time": datetime.now().isoformat(),
+                                    "responses": interview_data.responses
+                                },
+                                timeout=10.0
+                            )
+                            
+                            if response.status_code == 200:
+                                logger.info("✅ Session report saved to backend (frontend will be notified)")
+                            else:
+                                logger.error(f"❌ Backend save failed: {response.status_code} - {response.text}")
+                                
+                    except Exception as e:
+                        logger.error(f"❌ Failed to save to backend: {e}")
+                        import traceback
+                        traceback.print_exc()
+                else:
+                    logger.warning("⚠️ No evaluator found, skipping performance calculation")
+                    # Still try to get transcript if tracker exists
+                    transcript = interview_data.tracker.get_transcript() if interview_data.tracker else []
+            
+            except Exception as e:
+                logger.error(f"❌ Error in session end callback: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # Register the callback
+        try:
+            if hasattr(ctx, 'add_shutdown_callback'):
+                ctx.add_shutdown_callback(on_session_end)
+                logger.info("✅ Session end callback registered")
+            else:
+                # Fallback: Use session's cleanup or monitor
+                logger.warning("⚠️ ctx.add_shutdown_callback not available, using session cleanup")
+                # We'll rely on the monitor_interview function for cleanup
+        except Exception as e:
+            logger.warning(f"⚠️ Could not register shutdown callback: {e}")
+        
         # Set up transcript event listeners using session.on()
         @session.on(agents.UserInputTranscribedEvent)
-        def on_user_transcript_event(event: agents.UserInputTranscribedEvent):
+        async def on_user_transcript_event(event: agents.UserInputTranscribedEvent):
             """Handle user transcript events"""
             try:
-                if event.transcript.is_final and event.transcript.text.strip():
+                # Capture both final and interim transcripts
+                if event.transcript and event.transcript.text and event.transcript.text.strip():
                     text = event.transcript.text.strip()
-                    logger.info(f"📝 User transcript received: {text[:100]}...")
+                    is_final = getattr(event.transcript, 'is_final', True)
+                    logger.info(f"📝 User transcript event received (final={is_final}): {text[:100]}...")
                     # Add to transcript buffer via agent method
-                    asyncio.create_task(agent.on_user_transcript(text))
-                    # Use asyncio to call async handler
-                    asyncio.create_task(agent._handle_user_answer(text))
+                    await agent.on_user_transcript(text)
+                    # Only process for evaluation if it's final
+                    if is_final:
+                        await agent._handle_user_answer(text)
             except Exception as e:
                 logger.error(f"❌ Error in user transcript handler: {e}")
                 import traceback
@@ -634,9 +815,10 @@ INTERVIEW GUIDELINES:
                 
                 logger.info("📡 Starting conversation history monitoring...")
                 last_message_count = 0
+                processed_messages = set()  # Track processed messages to avoid duplicates
                 
                 while True:
-                    await asyncio.sleep(1)  # Check every second
+                    await asyncio.sleep(2)  # Check every 2 seconds
                     
                     try:
                         interview_data = session.userdata
@@ -651,17 +833,40 @@ INTERVIEW GUIDELINES:
                                 # Get new messages
                                 new_messages = messages[last_message_count:] if hasattr(messages, '__getitem__') else []
                                 
-                                for msg in new_messages:
+                                for idx, msg in enumerate(new_messages):
                                     try:
+                                        # Create unique ID for message to avoid duplicates
+                                        msg_id = f"{last_message_count + idx}_{id(msg)}"
+                                        if msg_id in processed_messages:
+                                            continue
+                                        
                                         # Check if it's a user or agent message
                                         if hasattr(msg, 'role') and hasattr(msg, 'content'):
                                             text = str(msg.content).strip() if msg.content else ""
                                             if text:
+                                                processed_messages.add(msg_id)
                                                 if msg.role == 'user':
                                                     logger.info(f"📝 Found user message in history: {text[:100]}...")
+                                                    # Add to transcript buffer
+                                                    await agent.on_user_transcript(text)
                                                     await agent._handle_user_answer(text)
                                                 elif msg.role == 'assistant' or msg.role == 'agent':
                                                     logger.info(f"🤖 Found agent message in history: {text[:100]}...")
+                                                    # Add to transcript buffer
+                                                    await agent.on_agent_speech(text)
+                                                    await agent._handle_agent_question(text)
+                                        elif hasattr(msg, 'role') and hasattr(msg, 'text'):
+                                            # Alternative message format
+                                            text = str(msg.text).strip() if msg.text else ""
+                                            if text:
+                                                processed_messages.add(msg_id)
+                                                if msg.role == 'user':
+                                                    logger.info(f"📝 Found user message (alt format): {text[:100]}...")
+                                                    await agent.on_user_transcript(text)
+                                                    await agent._handle_user_answer(text)
+                                                elif msg.role == 'assistant' or msg.role == 'agent':
+                                                    logger.info(f"🤖 Found agent message (alt format): {text[:100]}...")
+                                                    await agent.on_agent_speech(text)
                                                     await agent._handle_agent_question(text)
                                     except Exception as e:
                                         logger.debug(f"Error processing message from history: {e}")
@@ -670,7 +875,7 @@ INTERVIEW GUIDELINES:
                         
                     except Exception as e:
                         # This is expected if conversation history isn't accessible
-                        pass
+                        logger.debug(f"Conversation history check: {e}")
                         
             except Exception as e:
                 logger.debug(f"⚠️ Conversation history monitoring stopped: {e}")

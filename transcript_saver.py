@@ -38,17 +38,19 @@ def add_message(sender: str, text: str):
         "timestamp": time.time()
     })
     
-    logger.debug(f"💬 Added message from {sender}: {text[:50]}...")
+    logger.info(f"💬 Transcript: [{sender}] {text[:100]}{'...' if len(text) > 100 else ''}")
+    logger.debug(f"📊 Buffer size: {len(transcript_buffer)} messages")
 
 
 # ========================== TRANSCRIPT SAVE FUNCTION ==========================
-def save_transcript(interview_id: str = None, room_id: str = None):
+def save_transcript(interview_id: str = None, room_id: str = None, frontend_url: str = None):
     """
     Save the transcript to the backend API via POST request.
     
     Args:
         interview_id: Optional interview ID (will generate UUID if not provided)
         room_id: Optional room ID
+        frontend_url: Frontend URL to send the transcript to (defaults to env var or localhost)
     
     Returns:
         bool: True if successful, False otherwise
@@ -62,11 +64,13 @@ def save_transcript(interview_id: str = None, room_id: str = None):
         interview_id = str(uuid.uuid4())
         logger.info(f"📝 Generated interview_id: {interview_id}")
     
-    # Get API URL from environment or use default
-    api_url = os.getenv(
-        "TRANSCRIPT_API_URL",
-        "https://your-domain.com/api/interviews/save-transcript"
-    )
+    # Get API URL - use provided frontend_url, then env var, then default
+    if frontend_url:
+        base_url = frontend_url.rstrip('/')
+    else:
+        base_url = os.getenv("FRONTEND_URL", "http://localhost:3000").rstrip('/')
+    
+    api_url = f"{base_url}/api/interviews/save-transcript"
     
     # Prepare payload
     payload = {
@@ -76,11 +80,18 @@ def save_transcript(interview_id: str = None, room_id: str = None):
     }
     
     try:
-        logger.info(f"💾 Saving transcript to {api_url}...")
-        logger.info(f"📊 Messages: {len(transcript_buffer)}, Interview ID: {interview_id}")
+        logger.info("=" * 80)
+        logger.info(f"💾 SAVING TRANSCRIPT TO NEXT.JS API")
+        logger.info(f"   API URL: {api_url}")
+        logger.info(f"   Interview ID: {interview_id}")
+        logger.info(f"   Room ID: {room_id}")
+        logger.info(f"   Total Messages: {len(transcript_buffer)}")
+        logger.info("=" * 80)
         
         # Debug: Print final transcript buffer
-        print("🧾 FINAL TRANSCRIPT:", transcript_buffer)
+        logger.debug(f"🧾 Transcript preview (first 3 messages):")
+        for i, msg in enumerate(transcript_buffer[:3]):
+            logger.debug(f"   [{i+1}] {msg['sender']}: {msg['text'][:50]}...")
         
         res = requests.post(
             api_url,
@@ -89,27 +100,45 @@ def save_transcript(interview_id: str = None, room_id: str = None):
             timeout=10
         )
         
-        print("Transcript Save Status:", res.status_code, res.text)
+        logger.info(f"📡 API Response: HTTP {res.status_code}")
         
         if res.status_code == 200:
-            logger.info("✅ Transcript saved successfully!")
+            logger.info("=" * 80)
+            logger.info("✅ TRANSCRIPT SAVED SUCCESSFULLY!")
+            logger.info(f"   Interview ID: {interview_id}")
+            logger.info(f"   Room ID: {room_id}")
+            logger.info(f"   Messages sent: {len(transcript_buffer)}")
+            logger.info("=" * 80)
+            # Clear buffer after successful save to prepare for next interview
+            clear_buffer()
             return True
         else:
-            logger.error(f"❌ Failed to save transcript: HTTP {res.status_code}")
-            logger.error(f"Response: {res.text}")
+            logger.error("=" * 80)
+            logger.error(f"❌ FAILED TO SAVE TRANSCRIPT: HTTP {res.status_code}")
+            logger.error(f"   Response: {res.text}")
+            logger.error("=" * 80)
             return False
             
     except requests.exceptions.Timeout:
-        logger.error("❌ Timeout while saving transcript")
-        print("Transcript Save Status: TIMEOUT")
+        logger.error("=" * 80)
+        logger.error("❌ TIMEOUT WHILE SAVING TRANSCRIPT")
+        logger.error(f"   API URL: {api_url}")
+        logger.error("=" * 80)
         return False
     except requests.exceptions.ConnectionError:
-        logger.error(f"❌ Could not connect to API at {api_url}")
-        print("Transcript Save Status: CONNECTION_ERROR")
+        logger.error("=" * 80)
+        logger.error(f"❌ CONNECTION ERROR: Could not connect to API")
+        logger.error(f"   API URL: {api_url}")
+        logger.error("   Please check if the Next.js API is running")
+        logger.error("=" * 80)
         return False
     except Exception as e:
-        logger.error(f"❌ Error saving transcript: {e}")
-        print(f"Transcript Save Status: ERROR - {e}")
+        logger.error("=" * 80)
+        logger.error(f"❌ ERROR SAVING TRANSCRIPT: {e}")
+        logger.error(f"   API URL: {api_url}")
+        import traceback
+        logger.error(traceback.format_exc())
+        logger.error("=" * 80)
         return False
 
 
@@ -124,6 +153,16 @@ def clear_buffer():
 def get_buffer_size() -> int:
     """Get the number of messages in the buffer"""
     return len(transcript_buffer)
+
+
+def get_transcript() -> list:
+    """
+    Get the current transcript buffer.
+    
+    Returns:
+        list: List of message dictionaries with sender, text, and timestamp
+    """
+    return transcript_buffer.copy()
 
 
 # ========================== BACKWARD COMPATIBILITY ==========================
@@ -161,7 +200,8 @@ class TranscriptSaver:
         """Save transcript using the global function"""
         return save_transcript(
             interview_id=self.invitation_id,
-            room_id=self.room_id
+            room_id=self.room_id,
+            frontend_url=self.frontend_url
         )
     
     def get_message_count(self) -> int:
